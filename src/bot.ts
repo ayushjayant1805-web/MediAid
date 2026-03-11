@@ -1,0 +1,1037 @@
+import { Telegraf, Context, Markup } from 'telegraf';
+import { message } from 'telegraf/filters';
+import axios from 'axios';
+import fs from 'fs';
+import path from 'path';
+import { execSync } from 'child_process';
+import cron from 'node-cron';
+import { parseMedCommand, transcribeAudio, checkDosageSafety, analyzePrescription, analyzeLabReport, getHealthAwareResponse } from './services/groq-client.js';
+import * as db from './services/database.js';
+import { eq, and, ilike, sql, isNull, lt, gte, desc, isNotNull, lte, inArray } from 'drizzle-orm';
+import { fileURLToPath } from 'url';
+import express from 'express';
+
+// --- TIMEZONE CONFIGURATION ---
+// Ensure the process uses IST for Date operations where possible, 
+// though we will use explicit string formatting for critical checks.
+process.env.TZ = 'Asia/Kolkata'; 
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const bot = new Telegraf(process.env.BOT_TOKEN!);
+const app = express();
+const port = process.env.PORT || 3000;
+
+// Temporary storage
+const pendingConfirmations = new Map<number, any>();
+const pendingAdditions = new Map<number, any>();
+const photoCache = new Map<string, string>();
+
+app.get('/', (req, res) => {
+  res.send('MediAid Bot is running!');
+});
+
+// --- HELPER FUNCTIONS ---
+
+function parseFrequency(freq: any): number {
+    if (typeof freq === 'number') return freq;
+    if (!freq) return 1;
+    const s = freq.toString().toLowerCase();
+    if (s.includes('daily') || s.includes('every day')) return 1;
+    if (s.includes('other day') || s.includes('alternate')) return 2;
+    if (s.includes('weekly')) return 7;
+    const match = s.match(/(\d+)/);
+    return match ? parseInt(match[0]) : 1;
+}
+
+function inferTimeFromMedName(name: string): string {
+    const lower = name.toLowerCase();
+    if (lower.includes('sleep') || lower.includes('night') || lower.includes('bed') || lower.includes('ambien') || lower.includes('melatonin')) return "22:00";
+    if (lower.includes('morning') || lower.includes('thyroid') || lower.includes('vitamin')) return "08:00";
+    if (lower.includes('lunch') || lower.includes('afternoon')) return "13:00";
+    if (lower.includes('dinner') || lower.includes('evening')) return "19:00";
+    return "09:00"; // Final fallback
+}
+
+function parseTime(t: string | null | undefined, medName: string = ""): string {
+    if (!t) return inferTimeFromMedName(medName);
+
+    // Try to handle "2:30 PM" or "14:30" formats
+    const timeMatch = t.match(/(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
+    if (timeMatch) {
+        let hours = parseInt(timeMatch[1] as string);
+        const minutes = timeMatch[2];
+        const ampm = timeMatch[3]?.toUpperCase();
+
+        if (ampm === 'PM' && hours < 12) hours += 12;
+        if (ampm === 'AM' && hours === 12) hours = 0;
+
+        return `${hours.toString().padStart(2, '0')}:${minutes}`;
+    }
+    
+    // Fallback to existing inference logic
+    return inferTimeFromMedName(medName);
+}
+
+// Get current time string in IST (HH:MM)
+function getISTTime(): string {
+    const now = new Date();
+    return now.toLocaleTimeString('en-GB', { 
+        hour: '2-digit', 
+        minute: '2-digit', 
+        hour12: false, 
+        timeZone: 'Asia/Kolkata' 
+    });
+}
+
+async function sendAlarmSetupInstructions(ctx: Context) {
+    const instruction = `🔔 **Custom Alarm Setup**\n\n1. Download the audio file above.\n2. Go to **Bot Profile > Notifications > Customize/Select Tone**.\n3. Go to Sound and upload file as your custom notification sound.\n\nThis ensures you hear the alarm even if your phone is on 'vibrate'.`;
+    
+    try {
+        await ctx.replyWithAudio({ source: './assets/alarm_sound.mp3' }, {
+            caption: instruction,
+            parse_mode: 'Markdown'
+        });
+    } catch (err) {
+        await ctx.reply(instruction, { parse_mode: 'Markdown' });
+    }
+}
+
+async function handleUserIntent(ctx: Context, text: string, command?: any) {
+  const senderId = ctx.from?.id;
+  if (!senderId) return;
+
+  let userId = senderId;
+  const patientLink = await db.db.select().from(db.caregivers).where(eq(db.caregivers.caregiverTelegramId, senderId)).limit(1);
+  if (patientLink.length > 0) {
+     userId = patientLink[0]!.patientTelegramId;
+     await ctx.reply(`(Acting on behalf of patient ID: ${userId})`);
+  }
+
+  try {
+    const parsed = command || await parseMedCommand(text);
+
+    switch (parsed.intent) {
+      case 'add_medication': {
+        const medicationName = parsed.medicationName || 'Unknown Medication';
+        
+        const existing = await db.db.select().from(db.medications)
+          .where(and(eq(db.medications.telegramId, userId), ilike(db.medications.name, medicationName)))
+          .limit(1);
+
+        if (existing.length > 0) {
+          return await ctx.reply(`⚠️ You already have <b>${medicationName}</b> in your schedule.`, { parse_mode: 'HTML' });
+        }
+
+        if (parsed.dosage) {
+            const safety = await checkDosageSafety(medicationName, parsed.dosage);
+            if (!safety.safe) {
+                pendingAdditions.set(userId, parsed);
+                return await ctx.reply(
+                    `🚫 <b>SAFETY WARNING</b>\n${safety.warning}\n\nDo you still want to add this?`,
+                    { 
+                        parse_mode: 'HTML',
+                        ...Markup.inlineKeyboard([
+                            Markup.button.callback("✅ Yes, Add It", "confirm_unsafe_add"),
+                            Markup.button.callback("❌ No, Cancel", "cancel_unsafe_add")
+                        ]) 
+                    }
+                );
+            }
+        }
+        await addMedicationToDb(ctx, userId, parsed);
+        break;
+      }
+
+      case 'sos': {
+        const link = await db.db.select().from(db.caregivers).where(eq(db.caregivers.patientTelegramId, userId)).limit(1);
+        if (link.length > 0) {
+            await bot.telegram.sendMessage(link[0]!.caregiverTelegramId, `🚨 <b>SOS ALERT</b>\nPatient ${userId} needs help immediately!`, { parse_mode: 'HTML' });
+            await ctx.reply("🚨 <b>SOS sent to your caretaker!</b>", { parse_mode: 'HTML' });
+        } else {
+            await ctx.reply("⚠️ No caretaker set up.");
+        }
+        break;
+      }
+
+      case 'log_health': {
+        if (parsed.healthType && parsed.healthValue) {
+            await db.db.insert(db.healthLogs).values({
+                telegramId: userId,
+                type: parsed.healthType,
+                value: parsed.healthValue
+            });
+            await ctx.reply(`✅ Logged <b>${parsed.healthType}</b>: ${parsed.healthValue}`, { parse_mode: 'HTML' });
+        } else {
+            await ctx.reply("Please specify the value (e.g., 'BP is 120/80')");
+        }
+        break;
+      }
+
+      case 'add_appointment': {
+        if (parsed.appointmentTitle) {
+          let dateObj: Date;
+          const now = new Date();
+          const dateStr = parsed.appointmentDate || "";
+
+          // 1. Check for time-only strings (e.g., "19:33" or "7:33pm")
+          if (dateStr.match(/^\d{1,2}:\d{2}/) || dateStr.toLowerCase().includes('pm') || dateStr.toLowerCase().includes('am')) {
+              const datePart = now.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+              dateObj = new Date(`${datePart} ${dateStr} GMT+0530`);
+              
+              if (dateObj < now) {
+                  dateObj.setDate(dateObj.getDate() + 1);
+              }
+          } 
+          // 2. Check for full ISO/Date-Time strings (e.g., "2026-02-05 19:33")
+          else if (dateStr.includes(' ') || dateStr.includes('T')) {
+              // Append IST offset if no timezone is present in the string
+              const tzSafeStr = dateStr.match(/[Z+-]/) ? dateStr : `${dateStr} GMT+0530`;
+              dateObj = new Date(tzSafeStr);
+          }
+          // 3. Fallback for date-only strings (e.g., "2026-02-05")
+          else if (dateStr) {
+              dateObj = new Date(`${dateStr} 00:00:00 GMT+0530`);
+          } else {
+              return await ctx.reply("Please specify a date or time for the appointment.");
+          }
+
+            if (isNaN(dateObj.getTime())) {
+                return await ctx.reply("I understood the appointment title, but the date/time format was unclear.");
+            }
+
+            await db.db.insert(db.appointments).values({
+                telegramId: userId,
+                title: parsed.appointmentTitle,
+                date: dateObj
+            });
+            await ctx.reply(`🗓️ Appointment set: <b>${parsed.appointmentTitle}</b> on ${dateObj.toLocaleString('en-GB', { timeZone: 'Asia/Kolkata' })}`, { parse_mode: 'HTML' });
+        } else {
+            await ctx.reply("I need a title for the appointment (e.g., 'Dentist at 5pm').");
+        }
+        break;
+      }
+
+      case 'update_appointment': {        
+        if (!parsed.appointmentTitle) return await ctx.reply("Which appointment do you want to update?");
+
+        const updateData: any = {};
+        if (parsed.appointmentDate) updateData.date = new Date(parsed.appointmentDate);
+        // Add other potential fields here, like a new title if the LLM parses it
+
+        // --- FIX: Check if there is actually anything to update ---
+        if (Object.keys(updateData).length === 0) {
+            return await ctx.reply("I understood the appointment, but you didn't provide complete details (both time and date) to update.");
+        }
+
+        const updatedAppt = await db.db.update(db.appointments)
+            .set(updateData)
+            .where(and(eq(db.appointments.telegramId, userId), ilike(db.appointments.title, `%${parsed.appointmentTitle}%`)))
+            .returning();
+
+        if (updatedAppt.length > 0) await ctx.reply(`✅ Updated appointment: <b>${updatedAppt[0]!.title}</b>`, { parse_mode: 'HTML' });
+        else await ctx.reply(`⚠️ Couldn't find an appointment matching "${parsed.appointmentTitle}".`);
+        break;
+      }
+
+      case 'remove_appointment': {
+          if (!parsed.appointmentTitle) return await ctx.reply("Which appointment should I cancel?");
+
+          const deletedAppt = await db.db.delete(db.appointments)
+              .where(and(eq(db.appointments.telegramId, userId), ilike(db.appointments.title, `%${parsed.appointmentTitle}%`)))
+              .returning();
+
+          if (deletedAppt.length > 0) await ctx.reply(`🗑️ Cancelled appointment: <b>${deletedAppt[0]!.title}</b>`, { parse_mode: 'HTML' });
+          else await ctx.reply(`⚠️ Couldn't find an appointment matching "${parsed.appointmentTitle}".`);
+          break;
+      }
+
+      case 'update_medication': {
+        if (!parsed.medicationName) return await ctx.reply("Please specify the medication name.");
+
+        const updateData: any = {};
+        if (parsed.dosage) updateData.dosage = parsed.dosage;
+        if (parsed.time) updateData.schedule = parseTime(parsed.time);
+        if (parsed.frequencyDays) updateData.frequency = parsed.frequencyDays;
+
+        const updated = await db.db.update(db.medications)
+          .set(updateData)
+          .where(and(eq(db.medications.telegramId, userId), ilike(db.medications.name, `%${parsed.medicationName}%`)))
+          .returning();
+
+        if (updated.length > 0) await ctx.reply(`Updated <b>${parsed.medicationName}</b> successfully.`, { parse_mode: 'HTML' });
+        else await ctx.reply(`⚠️ Couldn't find "${parsed.medicationName}".`);
+        break;
+      }
+      
+      case 'remove_medication':
+        if (parsed.medicationName) {
+            const medskq = await db.db.select().from(db.medications)
+                .where(and(eq(db.medications.telegramId, userId), ilike(db.medications.name, `%${parsed.medicationName}%`)));
+
+            if (medskq.length > 0) {
+                const medIds = medskq.map(m => m.id);
+                await db.db.delete(db.adherenceLogs).where(inArray(db.adherenceLogs.medicationId, medIds));
+                await db.db.delete(db.medications).where(inArray(db.medications.id, medIds));
+                await ctx.reply(`🗑️ Removed <b>${parsed.medicationName}</b>.`, { parse_mode: 'HTML' });
+            } else {
+                await ctx.reply(`⚠️ Could not find "${parsed.medicationName}".`);
+            }
+        }
+        break;
+
+      case 'log_intake':
+        let medId: number | null = null;
+        let loggedName = parsed.medicationName || 'Medicine';
+
+        if (parsed.medicationName) {
+            // 1. Try exact/fuzzy match
+            let existing = await db.db.select().from(db.medications)
+                .where(and(eq(db.medications.telegramId, userId), ilike(db.medications.name, `%${parsed.medicationName}%`)))
+                .limit(1);
+            
+            // 2. Fallback: If no match, try checking if the scheduled name is inside the user input (reverse search)
+            if (existing.length === 0) {
+                 const allMeds = await db.db.select().from(db.medications).where(eq(db.medications.telegramId, userId));
+                 const match = allMeds.find(m => parsed.medicationName!.toLowerCase().includes(m.name.toLowerCase()));
+                 if (match) existing = [match];
+            }
+
+            if (existing.length > 0) {
+                medId = existing[0]!.id;
+                loggedName = existing[0]!.name; // Use the official DB name
+            }
+        }
+
+        // Insert log
+        await db.db.insert(db.adherenceLogs).values({ 
+            telegramId: userId, 
+            status: 'taken', 
+            medicationId: medId 
+        });
+
+        if (medId) {
+            await ctx.reply(`✅ Logged intake: <b>${loggedName}</b>`, { parse_mode: 'HTML' });
+        } else {
+            // Warn if we logged it but couldn't link it to a schedule
+            await ctx.reply(`✅ Logged intake for <b>${parsed.medicationName}</b>, but I couldn't match it to your schedule. Please ensure the name matches exactly next time.`, { parse_mode: 'HTML' });
+        }
+        break;
+
+      case 'query_health':
+        const logs = await db.db.select().from(db.healthLogs)
+            .where(eq(db.healthLogs.telegramId, userId))
+            .orderBy(desc(db.healthLogs.timestamp))
+            .limit(5);
+        
+        if (logs.length === 0) await ctx.reply("No health logs found.");
+        else {
+            const msg = logs.map(l => `❤️ <b>${l.type}</b>: ${l.value} <i>(${l.timestamp?.toLocaleDateString()})</i>`).join('\n');
+            await ctx.reply(`🏥 <b>Recent Health Logs</b>\n\n${msg}`, { parse_mode: 'HTML' });
+        }
+        break;
+
+      case 'query_schedule':
+        const meds = await db.db.select().from(db.medications).where(eq(db.medications.telegramId, userId));
+        const appts = await db.db.select().from(db.appointments)
+            .where(and(eq(db.appointments.telegramId, userId), gte(db.appointments.date, new Date())))
+            .orderBy(db.appointments.date);
+
+        let msg = "";
+        if (meds.length > 0) {
+          msg += "💊 <b>Medication Schedule</b>\n";
+          msg += meds.map(m => {
+              const freq = m.frequency === 1 ? "Daily" : `Every ${m.frequency} days`;
+              
+              // --- NEW LOGIC: REMAINING TIME ---
+              let remainingText = "";
+              if (m.endDate) {
+                  const now = new Date();
+                  const diffTime = m.endDate.getTime() - now.getTime();
+                  const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+                  
+                  if (diffDays > 0) {
+                      remainingText = ` | ⏳ ${diffDays} days left`;
+                  } else {
+                      remainingText = ` | ⚠️ Course ended`;
+                  }
+              }
+              // ---------------------------------
+
+              return `• <b>${m.name}</b> (${m.dosage})\n  🕒 ${m.schedule} | 🔄 ${freq}${remainingText}`;
+          }).join('\n\n');
+        } else {
+            msg += "💊 No medications scheduled.\n";
+        }
+
+        if (appts.length > 0) {
+            msg += "\n\n🗓️ <b>Upcoming Appointments</b>\n";
+            msg += appts.map(a => `• <b>${a.title}</b>\n  🕒 ${a.date.toLocaleDateString()} at ${a.date.toLocaleTimeString()}`).join('\n');
+        }
+
+        await ctx.reply(msg, { parse_mode: 'HTML' });
+        break;
+
+      case 'query_appointments':
+        const myAppts = await db.db.select().from(db.appointments)
+            .where(and(eq(db.appointments.telegramId, userId), gte(db.appointments.date, new Date())))
+            .orderBy(db.appointments.date);
+            
+        if (myAppts.length === 0) await ctx.reply("No upcoming appointments.");
+        else {
+            const list = myAppts.map(a => `• <b>${a.title}</b> on ${a.date.toLocaleDateString()} ${a.date.toLocaleTimeString()}`).join('\n');
+            await ctx.reply(`🗓️ <b>Upcoming Appointments</b>\n\n${list}`, { parse_mode: 'HTML' });
+        }
+        break;
+
+      case 'query_missed':
+        const currentISTTime = getISTTime();
+        const todayMeds = await db.db.select().from(db.medications)
+            .where(and(
+                eq(db.medications.telegramId, userId),
+                lte(db.medications.schedule, currentISTTime) // Scheduled before now
+            ));
+
+        const todayLogs = await db.db.execute(sql`
+            SELECT medication_id FROM adherence_logs 
+            WHERE telegram_id = ${userId} 
+            AND status = 'taken' 
+            AND DATE(timestamp AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') = DATE(NOW() AT TIME ZONE 'Asia/Kolkata')
+        `);
+        
+        const takenIds = todayLogs.rows.map((r: any) => r.medication_id);
+        const missedMedsList = todayMeds.filter(m => !takenIds.includes(m.id));
+
+        if (missedMedsList.length === 0) {
+            await ctx.reply("✅ <b>Good job!</b> You haven't missed any medications so far today.", { parse_mode: 'HTML' });
+        } else {
+            const missedText = missedMedsList.map(m => `• <b>${m.name}</b> (Scheduled: ${m.schedule})`).join('\n');
+            await ctx.reply(`⚠️ <b>Missed Medications Today:</b>\n\n${missedText}`, { parse_mode: 'HTML' });
+        }
+        break;
+      
+      case 'general_conversation':
+        if (parsed.response) await ctx.reply(parsed.response);
+        else await ctx.reply("How can I help with your meds today?");
+        break;
+
+      default:
+        await ctx.reply("I didn't quite catch that. Try saying 'Add Aspirin at 9am'.");
+    }
+  } catch (error) {
+    console.error(error);
+    await ctx.reply("Something went wrong. Please try again.");
+  }
+}
+
+async function addMedicationToDb(ctx: Context, userId: number, parsed: any) {
+    let endDate = null;
+    if (parsed.durationDays) {
+        const d = new Date();
+        d.setDate(d.getDate() + parsed.durationDays);
+        endDate = d;
+    }
+    const freq = parseFrequency(parsed.frequencyDays);
+    const time = parseTime(parsed.time, parsed.medicationName || "");
+
+    await db.db.insert(db.medications).values({
+        telegramId: userId,
+        name: parsed.medicationName || 'Unknown',
+        dosage: parsed.dosage || 'As prescribed',
+        schedule: time,
+        frequency: freq,
+        endDate: endDate,
+        notes: parsed.notes || null,       // [NEW]
+        allowSnooze: parsed.allowSnooze ?? true // [NEW]
+    });
+    
+    let confirmMsg = `✅ Added <b>${parsed.medicationName}</b> at ${time}.`;
+    if (parsed.notes) confirmMsg += `\n📝 Note: ${parsed.notes}`;
+    await ctx.reply(confirmMsg, { parse_mode: 'HTML' });
+}
+
+bot.help(async (ctx) => {
+  const helpMessage = `
+🆘 **MediAid Help - How to Use**
+
+I am your personal health assistant. You can talk to me via text or voice!
+
+💊 **Medications**
+• **Add:** "Add 5mg Aspirin daily at 9 AM"
+• **Log Intake:** "I took my Aspirin" or click the "Taken" button on reminders.
+• **Remove:** "Stop my Aspirin medication"
+• **Check Schedule:** "What is my routine?" or type "My Schedule"
+• **Missed Meds:** "Did I forget any pills today?"
+
+🗓️ **Appointments**
+• **Set:** "Dentist appointment on Feb 20 at 2 PM"
+• **Update:** "Change my dentist appointment to 4 PM"
+• **Cancel:** "Cancel my doctor visit"
+• **View:** "Show my appointments"
+
+❤️ **Health Tracking**
+• **Log Vitals:** "My BP is 120/80" or "Weight is 75kg"
+• **View History:** "Show my health logs"
+
+📁 **Prescription Scan**
+• Send me a **photo of your prescription**, and I will automatically parse and add the medications to your schedule.
+
+👤 **Caretaker Setup**
+• **/setcaretaker** - Choose someone to receive alerts if you miss a dose or send an SOS.
+• **/becomecaretaker** - Request to manage a patient's health.
+
+🚨 **Emergency**
+• Say **"Help me"** or **"SOS"** to immediately alert your caretaker.
+  `;
+  ctx.reply(helpMessage, { parse_mode: 'Markdown' });
+  await sendAlarmSetupInstructions(ctx);
+});
+
+// --- Safety Confirmation Actions ---
+
+bot.action("confirm_unsafe_add", async (ctx) => {
+    const userId = ctx.from!.id;
+    // Handle caretaker masquerading
+    let targetId = userId;
+    const link = await db.db.select().from(db.caregivers).where(eq(db.caregivers.caregiverTelegramId, userId)).limit(1);
+    if(link.length > 0) targetId = link[0]!.patientTelegramId;
+
+    const parsed = pendingAdditions.get(targetId);
+    
+    if (parsed) {
+        await addMedicationToDb(ctx, targetId, parsed);
+        pendingAdditions.delete(targetId);
+        await ctx.editMessageText(`✅ Warning acknowledged. Medication added.`);
+    } else {
+        await ctx.editMessageText("⚠️ Session expired. Please try adding the medication again.");
+    }
+});
+
+bot.action("cancel_unsafe_add", async (ctx) => {
+    const userId = ctx.from!.id;
+    let targetId = userId;
+    const link = await db.db.select().from(db.caregivers).where(eq(db.caregivers.caregiverTelegramId, userId)).limit(1);
+    if(link.length > 0) targetId = link[0]!.patientTelegramId;
+
+    pendingAdditions.delete(targetId);
+    await ctx.editMessageText("❌ Medication addition cancelled.");
+});
+
+// --- Image Handling ---
+
+bot.on(message('photo'), async (ctx) => {
+    const photo = ctx.message.photo.pop();
+    if (!photo) return;
+    
+    // Store the mapping so we can retrieve the full file_id later
+    photoCache.set(photo.file_unique_id, photo.file_id);
+    
+    await ctx.reply("What is this photo?", Markup.inlineKeyboard([
+        // Use file_unique_id here (it is much shorter)
+        [Markup.button.callback("💊 Prescription", `scan_presc_${photo.file_unique_id}`)],
+        [Markup.button.callback("🔬 Lab Report", `scan_lab_${photo.file_unique_id}`)]
+    ]));
+});
+
+bot.action(/scan_presc_(.+)/, async (ctx) => {
+    const uniqueId = ctx.match[1];
+    const fileId = photoCache.get(uniqueId as string);
+
+    if (!fileId) {
+        return await ctx.answerCbQuery("⚠️ Session expired or invalid photo.", { show_alert: true });
+    }
+
+    try {
+        await ctx.editMessageText("🔍 Scanning prescription... please wait.");
+        
+        const fileLink = await ctx.telegram.getFileLink(fileId);
+        const response = await axios.get(fileLink.href, { responseType: 'arraybuffer' });
+        const buffer = Buffer.from(response.data);
+
+        const analysis = await analyzePrescription(buffer);
+
+        if (!analysis.isLegit) {
+            return await ctx.reply("⚠️ This does not look like a valid prescription. Please upload a clear photo.");
+        }
+
+        let confirmMsg = "<b>Prescription Detected</b>\nIs this correct?\n";
+        analysis.medications.forEach((m: any, i: number) => {
+            const time = parseTime(m.time);
+            confirmMsg += `\n${i+1}. 💊 ${m.name} - ${m.dosage} at ${time}`;
+            if (m.notes) confirmMsg += `\n   📝 <i>Note: ${m.notes}</i>`;
+        });
+
+        // Store the full analysis object including notes
+        pendingConfirmations.set(ctx.from.id, analysis.medications);
+
+        await ctx.reply(confirmMsg, {
+            parse_mode: 'HTML',
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback("✅ Yes, Add All", "confirm_prescription")],
+                [Markup.button.callback("❌ No, Cancel", "cancel_prescription")]
+            ])
+        });
+
+    } catch (e) {
+        console.error("Prescription Scan Error:", e);
+        await ctx.reply("Error processing image. Please ensure the photo is clear.");
+    }
+});
+
+bot.action(/scan_lab_(.+)/, async (ctx) => {
+    const uniqueId = ctx.match[1];
+    const fileId = photoCache.get(uniqueId as string);
+    
+    if (!fileId) {
+        return await ctx.answerCbQuery("⚠️ Session expired.", { show_alert: true });
+    }
+
+    try {
+        await ctx.editMessageText("🔬 Analyzing lab report... please wait.");
+        
+        const fileLink = await ctx.telegram.getFileLink(fileId);
+        const response = await axios.get(fileLink.href, { responseType: 'arraybuffer' });
+        
+        const analysis = await analyzeLabReport(Buffer.from(response.data));
+
+        // --- PROPER FORMATTING START ---
+        if (!analysis.summary.key_biomarkers || analysis.summary.key_biomarkers.length === 0) {
+            return await ctx.reply("⚠️ Could not extract specific biomarkers. Please consult a doctor.");
+        }
+
+        let reportText = `📊 **Lab Report Analysis**\n\n`;
+
+        analysis.summary.key_biomarkers.forEach((b: any) => {
+            // Determine emoji based on interpretation
+            const isNormal = b.interpretation.toLowerCase().includes('normal') || 
+                             b.interpretation.toLowerCase().includes('within normal limits');
+            const statusEmoji = isNormal ? '✅' : '⚠️';
+
+            reportText += `${statusEmoji} **${b.name}**\n`;
+            reportText += `   Result: \`${b.value} ${b.units}\`\n`;
+            reportText += `   Range: ${b.reference_range}\n`;
+            reportText += `   *${b.interpretation}*\n\n`;
+        });
+
+        reportText += `💡 _Disclaimer: This is an AI summary. Always verify with your healthcare provider._`;
+        // --- PROPER FORMATTING END ---
+
+        await ctx.reply(reportText, { parse_mode: 'Markdown' });
+    } catch (e) {
+        console.error("Lab Analysis Error:", e);
+        await ctx.reply("Failed to analyze the lab report. Please try a clearer image.");
+    }
+});
+
+bot.action("confirm_prescription", async (ctx) => {
+    const meds = pendingConfirmations.get(ctx.from.id);
+    if (!meds) return await ctx.editMessageText("⚠️ Session expired.");
+
+    for (const m of meds) {
+        const freq = parseFrequency(m.frequency);
+        const time = parseTime(m.time);
+
+        await db.db.insert(db.medications).values({
+            telegramId: ctx.from.id,
+            name: m.name,
+            dosage: m.dosage,
+            schedule: time,
+            frequency: freq,
+            // Capture notes from the scanner (e.g. "Take after breakfast")
+            notes: m.notes || null, 
+            allowSnooze: m.allowSnooze ?? true
+        });
+    }
+    
+    pendingConfirmations.delete(ctx.from.id);
+    await ctx.editMessageText("✅ All medications added to your schedule.");
+});
+
+bot.action("cancel_prescription", async (ctx) => {
+    pendingConfirmations.delete(ctx.from.id);
+    await ctx.editMessageText("❌ Prescription scan cancelled.");
+});
+
+// --- Caretaker Setup ---
+
+bot.command('setcaretaker', (ctx) => {
+  ctx.reply("To add a caretaker, please click the button below and select them from your chat list:",
+    Markup.keyboard([
+      Markup.button.userRequest("👤 Select Caretaker", 1)
+    ]).resize().oneTime()
+  );
+});
+
+bot.command('becomecaretaker', (ctx) => {
+    ctx.reply("To become a caretaker, please share the **Patient's Contact**:", 
+        Markup.keyboard([
+            Markup.button.userRequest("👤 Share Patient Contact", 2) // ID 2 for differentiation
+        ]).resize().oneTime()
+    );
+});
+
+bot.command('timezone', async (ctx) => {
+    const tz = ctx.payload; // e.g., /timezone Europe/London
+    if (!tz) return ctx.reply("Usage: /timezone Asia/Kolkata");
+    
+    await db.db.insert(db.users)
+        .values({ telegramId: ctx.from.id, timezone: tz })
+        .onConflictDoUpdate({ target: db.users.telegramId, set: { timezone: tz } });
+    
+    ctx.reply(`✅ Timezone updated to ${tz}`);
+});
+
+bot.on('message', async (ctx, next) => {
+    const msg = ctx.message as any;
+
+    // --- FIX: Handle "Set Caretaker" Flow (request_id 1) ---
+    if (msg.user_shared && msg.user_shared.request_id === 1) {
+        const patientId = ctx.from.id;
+        const caregiverId = msg.user_shared.user_id;
+
+        try {
+            // Save the relationship to the database
+            await db.db.insert(db.caregivers)
+                .values({ 
+                    patientTelegramId: patientId, 
+                    caregiverTelegramId: caregiverId 
+                })
+                .onConflictDoUpdate({ 
+                    target: db.caregivers.patientTelegramId, 
+                    set: { caregiverTelegramId: caregiverId } 
+                });
+
+            await ctx.reply("✅ Caretaker successfully updated!");
+
+            // Optional: Notify the caretaker
+            try {
+                await bot.telegram.sendMessage(caregiverId, `ℹ️ You have been assigned as a caretaker for ${ctx.from.first_name || 'a patient'}.`);
+            } catch (e) {
+                await ctx.reply("⚠️ Caretaker saved, but I couldn't notify them. Please ask them to start this bot.");
+            }
+        } catch (error) {
+            console.error("Error setting caretaker:", error);
+            await ctx.reply("Failed to set caretaker. Please try again.");
+        }
+        return; // Stop further processing
+    }
+    
+    // --- Existing "Become Caretaker" Flow (request_id 2) ---
+    if (msg.user_shared && msg.user_shared.request_id === 2) {
+        const caretakerId = ctx.from.id;
+        const patientId = msg.user_shared.user_id;
+
+        // Send request to Patient
+        try {
+            await bot.telegram.sendMessage(patientId, 
+                `👤 User ${ctx.from.first_name} wants to be your Caretaker.\nDo you accept?`,
+                Markup.inlineKeyboard([
+                    Markup.button.callback("✅ Accept", `accept_care_${caretakerId}`), //
+                    Markup.button.callback("❌ Deny", `deny_care`)
+                ])
+            );
+            await ctx.reply("✅ Request sent to patient. Waiting for approval.");
+        } catch (e) {
+            await ctx.reply("⚠️ Could not reach patient. They must start this bot first.");
+        }
+        return;
+    }
+
+    return next();
+});
+
+bot.start(async (ctx) => {
+  ctx.reply(
+    `👵 Welcome to MediAid.\nTry saying 'Add 5mg Lisinopril at 8 AM' or 'I took my medicine'.\n\nType /help at any time to see everything I can do.`, 
+    Markup.keyboard([['My Schedule', 'I took my medicine']]).resize()
+  );
+  await sendAlarmSetupInstructions(ctx);
+});
+
+bot.on(message('text'), async (ctx) => {
+    const text = ctx.message.text;
+    const userId = ctx.from.id;
+
+    const parsed = await parseMedCommand(text);
+
+    const healthKeywords = ['diet', 'eat', 'food', 'allergy', 'workout', 'health'];
+    if (parsed.intent === 'general_conversation' && healthKeywords.some(k => text.toLowerCase().includes(k))) {
+        const logs = await db.db.select().from(db.healthLogs).where(eq(db.healthLogs.telegramId, userId)).limit(5);
+        const healthContext = logs.map(l => `${l.type}: ${l.value}`).join(", ");
+        const response = await getHealthAwareResponse(text, healthContext);
+        return ctx.reply(response, { parse_mode: 'Markdown' });
+    }
+
+    // 3. Otherwise, proceed with the command logic
+    await handleUserIntent(ctx, text, parsed)
+});
+
+bot.on(message('voice'), async (ctx) => {
+  const userId = ctx.from.id;
+  const ogaPath = path.join(__dirname, `temp_${userId}.oga`);
+  const mp3Path = path.join(__dirname, `temp_${userId}.mp3`);
+
+  try {
+    const fileLink = await ctx.telegram.getFileLink(ctx.message.voice.file_id);
+    const response = await axios.get(fileLink.href, { responseType: 'arraybuffer' });
+    fs.writeFileSync(ogaPath, Buffer.from(response.data));
+    execSync(`ffmpeg -i "${ogaPath}" "${mp3Path}" -y`);
+
+    const transcript = await transcribeAudio(mp3Path); 
+    await handleUserIntent(ctx, transcript);
+  } catch (e) {
+    ctx.reply("Sorry, I couldn't process that voice message.");
+  } finally {
+    if (fs.existsSync(ogaPath)) fs.unlinkSync(ogaPath);
+    if (fs.existsSync(mp3Path)) fs.unlinkSync(mp3Path);
+  }
+});
+
+// --- CRON JOBS ---
+
+// 1. Weekly Report (Sunday 9 AM)
+cron.schedule('0 9 * * 0', async () => {
+    console.log("Generating Weekly Reports...");
+    
+    // Get date 7 days ago
+    const weekAgo = new Date();
+    weekAgo.setDate(weekAgo.getDate() - 7);
+
+    // Fetch all active patients
+    const patients = await db.db.selectDistinct({ id: db.medications.telegramId }).from(db.medications);
+
+    for (const p of patients) {
+        const userId = p.id;
+
+        // A. Adherence Stats
+        const logs = await db.db.select()
+            .from(db.adherenceLogs)
+            .where(and(
+                eq(db.adherenceLogs.telegramId, userId),
+                gte(db.adherenceLogs.timestamp, weekAgo)
+            ));
+
+        const taken = logs.filter(l => l.status === 'taken').length;
+        const missed = logs.filter(l => l.status === 'missed').length;
+        const total = taken + missed;
+        const percentage = total > 0 ? Math.round((taken / total) * 100) : 0;
+
+        // B. Health Logs
+        const health = await db.db.select()
+            .from(db.healthLogs)
+            .where(and(
+                eq(db.healthLogs.telegramId, userId),
+                gte(db.healthLogs.timestamp, weekAgo)
+            ))
+            .orderBy(desc(db.healthLogs.timestamp));
+
+        let healthMsg = "";
+        if (health.length > 0) {
+            healthMsg = "\n\n🏥 **Health Vitals (Last 7 Days):**\n" + 
+                health.map(h => `• ${h.type}: ${h.value} (${h.timestamp?.toLocaleDateString()})`).join('\n');
+        }
+
+        const report = `📊 **Weekly Health Report**\n\n` +
+            `💊 **Medication Adherence:**\n` +
+            `• Taken: ${taken}\n• Missed: ${missed}\n• Score: ${percentage}%` +
+            healthMsg;
+
+        // Send to Patient
+        try {
+            await bot.telegram.sendMessage(userId, report);
+        } catch (e) { console.error(`Failed to send report to patient ${userId}`); }
+
+        // Send to Caretaker
+        const caretakerLink = await db.db.select().from(db.caregivers).where(eq(db.caregivers.patientTelegramId, userId)).limit(1);
+        if (caretakerLink.length > 0) {
+            try {
+                await bot.telegram.sendMessage(
+                    caretakerLink[0]!.caregiverTelegramId, 
+                    `📑 **Patient Report (ID: ${userId})**\n${report}`
+                );
+            } catch (e) { console.error(`Failed to send report to caretaker`); }
+        }
+    }
+});
+
+cron.schedule('* * * * *', async () => {
+    const allMeds = await db.db.select().from(db.medications);
+    
+    for (const med of allMeds) {
+        const userSettings = await db.db.select().from(db.users).where(eq(db.users.telegramId, med.telegramId)).limit(1);
+        const userTz = userSettings[0]?.timezone || 'Asia/Kolkata';
+
+        const now = new Date();
+        const userTimeNow = now.toLocaleTimeString('en-GB', { 
+            hour: '2-digit', minute: '2-digit', hour12: false, timeZone: userTz 
+        });
+
+        // --- NAG LIMIT LOGIC ---
+        // Only nag if current time is >= schedule AND within a 1-hour window
+        const [schedH, schedM] = med.schedule.split(':').map(Number);
+        const schedDate = new Date(now);
+        schedDate.setHours(schedH as number, schedM, 0, 0);
+        
+        const diffInMinutes = (now.getTime() - schedDate.getTime()) / 60000;
+
+        // Condition: Time has passed (diff > 0) AND it's less than 60 minutes ago
+        if (diffInMinutes >= 0 && diffInMinutes < 60) {
+            const todayLogs = await db.db.execute(sql`
+                SELECT id FROM adherence_logs 
+                WHERE medication_id = ${med.id} 
+                AND DATE(timestamp AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') = DATE(NOW() AT TIME ZONE 'Asia/Kolkata')
+            `);
+
+            if (todayLogs.rows.length > 0) continue;
+
+            // Snooze logic
+            if (med.snoozedUntil && med.snoozedUntil > new Date()) continue;
+
+            // Delete previous nagging message to prevent clutter
+            if (med.lastReminderMessageId) {
+                try {
+                    await bot.telegram.deleteMessage(med.telegramId, med.lastReminderMessageId);
+                } catch (e) { /* ignore deletion errors */ }
+            }
+
+            // Send new message
+            const buttons = [
+                Markup.button.callback("✅ Taken", `taken_${med.id}`),
+                Markup.button.callback("❌ Skip", `missed_${med.id}`)
+            ];
+            if (med.allowSnooze) buttons.push(Markup.button.callback("💤 Snooze 10m", `snooze_${med.id}`));
+
+            const sentMsg = await bot.telegram.sendMessage(med.telegramId, 
+                `⏰ **REMINDER**\nTake: ${med.name} (${med.dosage})${med.notes ? `\n\n📝 ${med.notes}` : ''}`, 
+                { parse_mode: 'Markdown', ...Markup.inlineKeyboard([buttons]) }
+            );
+
+            await db.db.update(db.medications)
+                .set({ lastReminderMessageId: sentMsg.message_id })
+                .where(eq(db.medications.id, med.id));
+        }
+    }
+});
+
+cron.schedule('* * * * *', async () => {   // <--- CHANGED from '0 * * * *'
+    const now = new Date();
+    // Look for appointments within the next 24 hours OR slightly in the past (e.g. last 5 mins)
+    // This ensures if the cron runs at 2:01 for a 2:00 appt, it still catches it.
+    
+    // We remove the 'gte(now)' restriction or widen it to catch recent misses
+    const lookbackWindow = new Date(now.getTime() - 15 * 60000); // 15 mins ago
+    const lookaheadWindow = new Date(now.getTime() + 24 * 60 * 60000); // 24 hours ahead
+
+    const upcoming = await db.db.select().from(db.appointments)
+        .where(and(
+            lt(db.appointments.date, lookaheadWindow), // < Now + 24h
+            gte(db.appointments.date, lookbackWindow), // > 15 mins ago (catches slightly missed ones)
+            eq(db.appointments.reminded, false)
+        ));
+
+    for (const appt of upcoming) {
+        await bot.telegram.sendMessage(appt.telegramId, `🗓️ REMINDER: Appointment '${appt.title}' is coming up on ${appt.date.toLocaleString('en-GB', { timeZone: 'Asia/Kolkata' })}`);
+        await db.db.update(db.appointments).set({ reminded: true }).where(eq(db.appointments.id, appt.id));
+    }
+});
+
+// 4. Daily Cleanup (Midnight)
+cron.schedule('59 23 * * *', async () => {
+    const missedMeds = await db.db.select({
+        id: db.medications.id,
+        telegramId: db.medications.telegramId,
+    })
+    .from(db.medications)
+    .leftJoin(db.adherenceLogs, and(
+        eq(db.medications.id, db.adherenceLogs.medicationId),
+        sql`DATE(${db.adherenceLogs.timestamp}) = CURRENT_DATE`
+    ))
+    .where(isNull(db.adherenceLogs.id));
+
+    for (const m of missedMeds) {
+        await db.db.insert(db.adherenceLogs).values({
+            telegramId: m.telegramId,
+            medicationId: m.id,
+            status: 'missed'
+        });
+    }
+
+    await db.db.delete(db.medications).where(lt(db.medications.endDate, new Date()));
+});
+
+// --- Action Listeners ---
+
+bot.action(/taken_(.+)/, async (ctx) => {
+    const medId = parseInt(ctx.match[1]!);
+    await db.db.update(db.medications).set({ lastReminderMessageId: null }).where(eq(db.medications.id, medId));
+    await db.db.insert(db.adherenceLogs).values({ telegramId: ctx.from!.id, medicationId: medId, status: 'taken' });
+    await ctx.answerCbQuery();
+    
+    // Feature 7: Show SOS button after taking medicine
+    await ctx.editMessageText(`✅ Intake logged.`, 
+        Markup.inlineKeyboard([
+            Markup.button.callback("🆘 Send SOS (Message Caretaker)", "sos_trigger")
+        ])
+    );
+});
+
+bot.action("sos_trigger", async (ctx) => {
+    // Re-use existing SOS logic
+    await handleUserIntent(ctx, "sos"); 
+});
+
+bot.action(/missed_(.+)/, async (ctx) => {
+  const medId = parseInt(ctx.match[1]!);
+  await db.db.update(db.medications).set({ lastReminderMessageId: null }).where(eq(db.medications.id, medId));
+  const patientId = ctx.from!.id;
+  const med = await db.db.select().from(db.medications).where(eq(db.medications.id, medId)).limit(1);
+  const medName = med[0]?.name || "Unknown";
+
+  await db.db.insert(db.adherenceLogs).values({ telegramId: patientId, medicationId: medId, status: 'missed' });
+
+  const link = await db.db.select().from(db.caregivers).where(eq(db.caregivers.patientTelegramId, patientId)).limit(1);
+  if (link.length > 0) {
+    await bot.telegram.sendMessage(link[0]!.caregiverTelegramId, `⚠️ ALERT: Patient missed ${medName}.`);
+  }
+  await ctx.editMessageText("⚠️ Missed logged. Caretaker notified.");
+});
+
+bot.action(/snooze_(.+)/, async (ctx) => {
+    const medId = parseInt(ctx.match[1] as string);
+    const snoozeTime = new Date(Date.now() + 10 * 60 * 1000); // 10 mins from now
+
+    await db.db.update(db.medications)
+        .set({ snoozedUntil: snoozeTime })
+        .where(eq(db.medications.id, medId));
+
+    await ctx.answerCbQuery("Snoozed 10m");
+    await ctx.editMessageText("💤 Snoozed. I'll remind you in 10 minutes.");
+});
+
+bot.action(/accept_care_(.+)/, async (ctx) => {
+    const caretakerId = parseInt(ctx.match[1]!);
+    const patientId = ctx.from.id;
+
+    await db.db.insert(db.caregivers)
+        .values({ patientTelegramId: patientId, caregiverTelegramId: caretakerId })
+        .onConflictDoUpdate({ target: db.caregivers.patientTelegramId, set: { caregiverTelegramId: caretakerId } });
+
+    await ctx.editMessageText("✅ Caretaker accepted!");
+    await bot.telegram.sendMessage(caretakerId, "✅ You are now the caretaker.");
+});
+
+bot.launch();
+bot.telegram.setMyCommands([
+  { command: 'help', description: 'Show usage guide' },
+  { command: 'setcaretaker', description: 'Setup a caretaker' },
+  { command: 'becomecaretaker', description: 'Become a caretaker' },
+  { command: 'schedule', description: 'View or manage your schedule' },
+  { command: 'appointments', description: 'View or manage your appointments' },
+  { command: 'health_measurements', description: 'View or manage your health measurements' },
+  { command: 'timezone', description: 'Set your timezone' },
+]);
+console.log("🚀 MediAid Bot is running...");
+
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+app.listen(port, () => console.log(`Web server on port ${port}`));
